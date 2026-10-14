@@ -45,7 +45,7 @@ $tar->extract_file("channel/default.nix", $defaultnix);
 
 print STDERR $tar->get_content("channel/default.nix");
 
-(my $status, my $stdout, my $stderr) = captureStdoutStderr(5, "nix-env", "--json", "--query", "--available", "--attr-path", "--file", $defaultnix);
+(my $status, my $stdout, my $stderr) = $ctx{context}->capture_cmd(5, "nix-env", "--json", "--query", "--available", "--attr-path", "--file", $defaultnix);
 is($stderr, "", "Stderr should be empty");
 is($status, 0, "Querying the packages should succeed");
 

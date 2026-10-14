@@ -29,13 +29,20 @@ impl OutputNameChain {
 /// returns `(A, ["foo"])`. For `Opaque(A)`, returns `(A, [])`.
 #[must_use]
 pub fn flatten_path(sdp: &SingleDerivedPath) -> (StorePath, OutputNameChain) {
-    match sdp {
-        SingleDerivedPath::Opaque(p) => (p.clone(), OutputNameChain::default()),
-        SingleDerivedPath::Built { drv_path, output } => flatten_chain(drv_path, output),
+    let mut current = sdp;
+    let mut outputs = Vec::new();
+    loop {
+        match current {
+            SingleDerivedPath::Opaque(p) => return (p.clone(), OutputNameChain(outputs)),
+            SingleDerivedPath::Built { drv_path, output } => {
+                outputs.push(output.clone());
+                current = drv_path;
+            }
+        }
     }
 }
 
-/// Like [`flatten_path`] but appends an additional output name.
+/// Like [`flatten_path`] but prepends the additional, outermost output name.
 ///
 /// For `Built { Opaque(A), "foo" }` with output `"bar"`,
 /// returns `(A, ["bar", "foo"])`.
@@ -45,7 +52,7 @@ pub fn flatten_chain(
     output_name: &OutputName,
 ) -> (StorePath, OutputNameChain) {
     let (root, mut chain) = flatten_path(drv_path);
-    chain.0.push(output_name.clone());
+    chain.0.insert(0, output_name.clone());
     (root, chain)
 }
 
@@ -63,4 +70,67 @@ pub fn input_drvs(drv: &Derivation) -> BTreeSet<(StorePath, OutputNameChain)> {
             SingleDerivedPath::Built { drv_path, .. } => Some(flatten_path(drv_path)),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(suffix: &str) -> SingleDerivedPath {
+        format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv{suffix}")
+            .parse()
+            .unwrap()
+    }
+
+    fn names(names: &[&str]) -> Vec<OutputName> {
+        names.iter().map(|name| name.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn flatten_opaque_and_static_output() {
+        let (root, chain) = flatten_path(&path(""));
+        assert_eq!(
+            root.to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv"
+        );
+        assert!(chain.0.is_empty());
+        assert_eq!(flatten_path(&path("^foo")).1.0, names(&["foo"]));
+    }
+
+    #[test]
+    fn distinct_dynamic_outputs_are_in_stack_order() {
+        let (_, mut chain) = flatten_path(&path("^foo^bar^bin"));
+        assert_eq!(chain.0, names(&["bin", "bar", "foo"]));
+        for name in names(&["foo", "bar", "bin"]) {
+            assert_eq!(chain.pop(), Some(name));
+        }
+        assert_eq!(chain.pop(), None);
+    }
+
+    #[test]
+    fn flatten_chain_adds_outermost_output() {
+        let (_, chain) = flatten_chain(&path("^foo^bar"), &"bin".parse().unwrap());
+        assert_eq!(chain.0, names(&["bin", "bar", "foo"]));
+    }
+
+    #[test]
+    fn dependency_relation_excludes_consumed_output() {
+        let drv = Derivation {
+            name: "consumer".parse().unwrap(),
+            outputs: Default::default(),
+            inputs: [path("^foo^bar^out"), path("")].into_iter().collect(),
+            platform: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            structured_attrs: None,
+        };
+        let (root, _) = flatten_path(&path(""));
+        assert_eq!(
+            input_drvs(&drv),
+            [(root, OutputNameChain(names(&["bar", "foo"])))]
+                .into_iter()
+                .collect()
+        );
+    }
 }

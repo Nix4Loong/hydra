@@ -9,6 +9,7 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use IPC::Run3;
 use Try::Tiny;
+use Hydra::Helper::CatalystUtils;
 use Hydra::Helper::Nix;
 use Hydra::StorePath;
 
@@ -226,6 +227,11 @@ sub buildFinished {
     my ($self, $build, $dependents) = @_;
     my $event = "buildFinished";
 
+    my $jobName = showJobName $build;
+    my $build_id = $build->id;
+
+    print STDERR "RunCommand: Processing build $build_id for job '$jobName'\n";
+
     my $commandsToRun = fanoutToCommands(
         $self->{config},
         $event,
@@ -234,15 +240,23 @@ sub buildFinished {
 
     if (@$commandsToRun == 0) {
         # No matching jobs, don't bother generating the JSON
+        print STDERR "RunCommand: No matching commands found for job '$jobName' (build $build_id)\n";
         return;
     }
+
+    print STDERR "RunCommand: Found " . scalar(@$commandsToRun) . " command(s) to execute for build $build_id\n";
 
     my $tmp = File::Temp->new(SUFFIX => '.json');
     print $tmp encode_json(makeJsonPayload($event, $build)) or die;
     local $ENV{"HYDRA_JSON"} = $tmp->filename;
 
+    print STDERR "RunCommand: Created JSON payload at " . $tmp->filename . " for build $build_id\n";
+
     foreach my $commandToRun (@{$commandsToRun}) {
         my $command = $commandToRun->{command};
+        my $matcher = $commandToRun->{matcher};
+
+        print STDERR "RunCommand: Executing command for matcher '$matcher': $command\n";
 
         # todo: make all the to-run jobs "unstarted" in a batch, then start processing
         my $runlog = $self->{db}->resultset("RunCommandLogs")->create({
@@ -252,6 +266,7 @@ sub buildFinished {
         });
 
         $runlog->started();
+        print STDERR "RunCommand: Started runlog entry " . $runlog->uuid . " for build $build_id\n";
 
         my $logPath = Hydra::Helper::Nix::constructRunCommandLogPath($runlog) or die "RunCommandLog not found.";
         my $dir = dirname($logPath);
@@ -266,19 +281,34 @@ sub buildFinished {
             open($f, '>', $logPath);
             umask($oldUmask);
 
-            run3($command, \undef, $f, $f, { return_if_system_error => 1 }) == 1
-                or warn "notification command '$command' failed with exit status $? ($!)\n";
+            print STDERR "RunCommand: Executing command with log output to $logPath\n";
+            my $process_started = run3($command, \undef, $f, $f, { return_if_system_error => 1 });
+            # run3 returns true even when the child exits unsuccessfully.
+            # Capture both process status and errno before logging or closing
+            # files can change the globals used for the database record.
+            my ($child_status, $error_number, $error_string) = ($?, 0 + $!, "$!");
 
             close($f);
 
-            $runlog->completed_with_child_error($?, $!);
+            if ($process_started && $child_status == 0) {
+                print STDERR "RunCommand: Command completed successfully for build $build_id\n";
+            } else {
+                print STDERR "RunCommand: Command failed with exit status $child_status for build $build_id\n";
+                warn "notification command '$command' failed with exit status $child_status ($error_string)\n";
+            }
+
+            $runlog->completed_with_child_error($child_status, $error_number);
+            print STDERR "RunCommand: Completed runlog entry " . $runlog->uuid . " for build $build_id\n";
             1;
         } catch {
+            print STDERR "RunCommand: Error processing command for build $build_id: $_\n";
             die "Died while trying to process RunCommand (${\$runlog->uuid}): $_";
         } finally {
             umask($oldUmask);
         };
     }
+
+    print STDERR "RunCommand: Finished processing all commands for build $build_id\n";
 }
 
 1;

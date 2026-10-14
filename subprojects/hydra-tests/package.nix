@@ -26,6 +26,7 @@
   openldap,
   postgresql_17,
   pixz,
+  zstd,
   nix-eval-jobs,
   curl,
   kanidm_1_10,
@@ -79,6 +80,7 @@ stdenv.mkDerivation (finalAttrs: {
     openldap
     postgresql_17
     pixz
+    zstd
     nix-eval-jobs
     socat
     curl
