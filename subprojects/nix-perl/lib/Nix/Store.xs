@@ -115,15 +115,23 @@ void init()
 
 
 int
-StoreWrapper::isValidPath(StorePath path)
+StoreWrapper::isValidPath(StorePath path, int refresh = 0)
     CODE:
         try {
+            // A long-lived client can outlive paths removed by another process.
+            if (refresh) THIS->store->clearPathInfoCache();
             RETVAL = THIS->store->isValidPath(path);
         } catch (Error & e) {
             croak("%s", e.what());
         }
     OUTPUT:
         RETVAL
+
+
+void
+StoreWrapper::clearPathInfoCache()
+    CODE:
+        THIS->store->clearPathInfoCache();
 
 
 SV *
@@ -164,11 +172,11 @@ StoreWrapper::queryPathInfo(StorePath path, int base32)
             AV * refs = newAV();
             for (auto & i : info->references)
                 av_push(refs, newSVStorePath(i));
-            XPUSHs(sv_2mortal(newRV((SV *) refs)));
+            XPUSHs(sv_2mortal(newRV_noinc((SV *) refs)));
             AV * sigs = newAV();
             for (auto & i : info->sigs)
                 av_push(sigs, newSVpv(i.to_string().c_str(), 0));
-            XPUSHs(sv_2mortal(newRV((SV *) sigs)));
+            XPUSHs(sv_2mortal(newRV_noinc((SV *) sigs)));
         } catch (Error & e) {
             croak("%s", e.what());
         }

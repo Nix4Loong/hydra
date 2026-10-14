@@ -29,6 +29,7 @@
   findutils,
   gzip,
   xz,
+  zstd,
   gnutar,
   gnused,
   nix-eval-jobs,
@@ -187,6 +188,7 @@ stdenv.mkDerivation (finalAttrs: {
       gzip
       bzip2
       xz
+      zstd
       gnutar
       unzip
       git

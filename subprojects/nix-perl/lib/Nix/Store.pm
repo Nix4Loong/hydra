@@ -22,6 +22,7 @@ our @EXPORT = qw(
     StoreWrapper::addToStore
     StoreWrapper::derivationSystem
     StoreWrapper::addTempRoot
+    StoreWrapper::clearPathInfoCache
 
     signString
     StoreWrapper::storeDir

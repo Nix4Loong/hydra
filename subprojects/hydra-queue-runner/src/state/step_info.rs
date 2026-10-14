@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,7 +8,7 @@ use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
 use harmonia_store_path::{StoreDir, StorePath};
 
 use super::Step;
-use super::drv::flatten_chain;
+use super::drv::{OutputNameChain, flatten_chain};
 use crate::config::StepSortFn;
 
 /// Resolve an input-addressed derivation output from the `.drv` file on
@@ -33,6 +34,60 @@ fn resolve_from_drv_file(
         .flatten()
 }
 
+/// Walk dynamic output chains one level at a time. Read authoritative .drv
+/// outputs first, then query all remaining links at that level in one batch.
+/// The memo includes misses and is shared across chains and levels.
+fn resolve_input_chains(
+    chains: &[(StorePath, OutputNameChain)],
+    mut read_drv: impl FnMut(&StorePath, &OutputName) -> Option<StorePath>,
+    mut query_batch: impl FnMut(&[(StorePath, OutputName)]) -> Vec<Option<StorePath>>,
+) -> Vec<Option<StorePath>> {
+    let mut states: Vec<_> = chains.iter().cloned().map(Some).collect();
+    let mut memo = HashMap::<(StorePath, OutputName), Option<StorePath>>::new();
+    loop {
+        let mut active = false;
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for (current, chain) in states.iter().flatten() {
+            let Some(output) = chain.0.last() else {
+                continue;
+            };
+            active = true;
+            let key = (current.clone(), output.clone());
+            if memo.contains_key(&key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            if let Some(path) = read_drv(current, output) {
+                memo.insert(key, Some(path));
+            } else {
+                missing.push(key);
+            }
+        }
+        if !active {
+            break;
+        }
+        if !missing.is_empty() {
+            let results = query_batch(&missing);
+            assert_eq!(results.len(), missing.len());
+            memo.extend(missing.into_iter().zip(results));
+        }
+        for state in &mut states {
+            let Some((current, chain)) = state else {
+                continue;
+            };
+            let Some(output) = chain.pop() else { continue };
+            match memo.get(&(current.clone(), output)).cloned().flatten() {
+                Some(path) => *current = path,
+                None => *state = None,
+            }
+        }
+    }
+    states
+        .into_iter()
+        .map(|state| state.map(|(path, _)| path))
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct StepInfo {
     pub step: Arc<Step>,
@@ -56,14 +111,14 @@ impl StepInfo {
     /// Resolve a derivation's inputs into concrete store paths, returning a
     /// [`BasicDerivation`](BasicDerivation).
     ///
-    /// Returns [`None`] if the derivation is input-addressed (shouldn't be resolved),
-    /// or if resolution fails because required outputs haven't been built yet.
+    /// Returns [`None`] if resolution fails because required outputs have not
+    /// been built yet or cannot be looked up.
     ///
     /// If the derivation has no [`Built`](SingleDerivedPath::Built) inputs, it is
     /// already resolved; the inputs are simply flattened to a [`StorePathSet`].
     ///
-    /// We only need a store dir, not a store, because all the info we need comes from the Hydra
-    /// database.
+    /// IA output paths come from local .drv files; CA output paths come from the
+    /// Hydra database, including persisted resolved derivation mappings.
     pub(super) async fn try_resolve_force(
         store_dir: &StoreDir,
         db: &db::Database,
@@ -91,64 +146,33 @@ impl StepInfo {
         drv.try_resolve_force(store_dir, &mut |inputs| {
             tokio::task::block_in_place(|| {
                 // Flatten each SingleDerivedPath chain into (root, [outputs...])
-                // and resolve everything in a single recursive SQL query.
+                // and resolve links with a shared memo for this batch.
                 let chains: Vec<_> = inputs
                     .iter()
                     .map(|(drv_path, output_name)| flatten_chain(drv_path, output_name))
                     .collect();
 
-                // SQL needs forward order; OutputNameChain stores reversed.
-                let chain_refs: Vec<_> = chains
-                    .iter()
-                    .map(|(root, chain)| (root, chain.0.iter().rev().collect::<Vec<_>>()))
-                    .collect();
-
-                let sql_input: Vec<_> = chain_refs
-                    .iter()
-                    .map(|(root, outputs)| (*root, outputs.as_slice()))
-                    .collect();
-
                 let rt = tokio::runtime::Handle::current();
-                let results = rt
-                    .block_on(conn.resolve_drv_output_chains(store_dir, &sql_input))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("resolve_drv_output_chains failed: {e}");
-                        vec![None; inputs.len()]
-                    });
-
-                // The build-history lookup can miss outputs that never got
-                // a successful build step row. For chains the SQL couldn't
-                // resolve, retry link by link, falling back to reading the
-                // `.drv` file, which is authoritative for input-addressed
-                // derivations. The per-link DB lookup matters too: a chain
-                // can mix links known only to the DB with links whose drv
-                // only exists on disk, and the recursive SQL stops at the
-                // first miss.
-                results
-                    .into_iter()
-                    .zip(&chain_refs)
-                    .map(|(result, (root, outputs))| {
-                        result.or_else(|| {
-                            let mut current = (*root).clone();
-                            for output_name in outputs {
-                                current = rt
-                                    .block_on(conn.resolve_drv_output(
-                                        store_dir,
-                                        &current,
-                                        output_name,
-                                    ))
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!("resolve_drv_output failed: {e}");
-                                        None
-                                    })
-                                    .or_else(|| {
-                                        resolve_from_drv_file(store_dir, &current, output_name)
-                                    })?;
-                            }
-                            Some(current)
-                        })
-                    })
-                    .collect()
+                resolve_input_chains(
+                    &chains,
+                    |path, output| resolve_from_drv_file(store_dir, path, output),
+                    |links| {
+                        // This query follows persisted resolvedDrvPath mappings for CA
+                        // outputs. Historical IA output-name mistakes are bypassed by
+                        // the authoritative .drv lookup above.
+                        let names: Vec<_> = links.iter().map(|(_, output)| [output]).collect();
+                        let inputs: Vec<_> = links
+                            .iter()
+                            .zip(&names)
+                            .map(|((path, _), names)| (path, names.as_slice()))
+                            .collect();
+                        rt.block_on(conn.resolve_drv_output_chains(store_dir, &inputs))
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("resolve_drv_output_chains failed: {e}");
+                                vec![None; links.len()]
+                            })
+                    },
+                )
             })
         })
     }
@@ -263,6 +287,239 @@ mod tests {
     use super::*;
     use db::models::BuildID;
     use std::cmp::Ordering::{Equal, Greater, Less};
+
+    fn sp(name: &str) -> StorePath {
+        format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}")
+            .parse()
+            .unwrap()
+    }
+
+    fn on(name: &str) -> OutputName {
+        name.parse().unwrap()
+    }
+
+    fn chain(root: &str, outputs: &[&str]) -> (StorePath, OutputNameChain) {
+        // Start from the public SingleDerivedPath representation so these tests
+        // also catch reversed flattening rather than hand-writing chain vectors.
+        let path: SingleDerivedPath = format!("{}^{}", sp(root), outputs.join("^"))
+            .parse()
+            .unwrap();
+        super::super::drv::flatten_path(&path)
+    }
+
+    fn write_ia_drv(store_dir: &StoreDir, name: &str, output: &str, path: &StorePath) {
+        let text = format!(
+            r#"Derive([("{output}","{}","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+            store_dir.display(path),
+        );
+        fs_err::write(store_dir.display(&sp(name)).to_string(), text).unwrap();
+    }
+
+    #[test]
+    fn ia_drv_overrides_wrong_historical_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_dir = StoreDir::new(temp.path().to_str().unwrap()).unwrap();
+        let expected = sp("authoritative-output");
+        write_ia_drv(&store_dir, "producer.drv", "lib", &expected);
+        let result = resolve_input_chains(
+            &[chain("producer.drv", &["lib"])],
+            |drv, output| resolve_from_drv_file(&store_dir, drv, output),
+            |_| panic!("must not use the historical output recorded under the wrong name"),
+        );
+        assert_eq!(result, vec![Some(expected)]);
+    }
+
+    #[test]
+    fn mixed_ia_ca_dynamic_chain_uses_distinct_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_dir = StoreDir::new(temp.path().to_str().unwrap()).unwrap();
+        write_ia_drv(&store_dir, "producer.drv", "foo", &sp("ca-link.drv"));
+        let ca_drv = br#"Derive([("bar","","sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let parsed = harmonia_store_aterm::parse_derivation_aterm(
+            &store_dir,
+            ca_drv,
+            "ca-link".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.outputs[&on("bar")],
+            harmonia_store_derivation::derivation::DerivationOutput::CAFloating(_)
+        ));
+        fs_err::write(store_dir.display(&sp("ca-link.drv")).to_string(), ca_drv).unwrap();
+        write_ia_drv(&store_dir, "tail.drv", "bin", &sp("result"));
+        let mut batches = Vec::new();
+        let result = resolve_input_chains(
+            &[chain("producer.drv", &["foo", "bar", "bin"])],
+            |drv, output| resolve_from_drv_file(&store_dir, drv, output),
+            |links| {
+                batches.push(links.to_vec());
+                assert_eq!(links, &[(sp("ca-link.drv"), on("bar"))]);
+                vec![Some(sp("tail.drv"))]
+            },
+        );
+        assert_eq!(result, vec![Some(sp("result"))]);
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn a_hundred_ca_inputs_use_one_database_batch() {
+        let chains: Vec<_> = (0..100)
+            .map(|n| chain(&format!("ca-{n}.drv"), &["out"]))
+            .collect();
+        let mut calls = 0;
+        let result = resolve_input_chains(
+            &chains,
+            |_, _| None,
+            |links| {
+                calls += 1;
+                assert_eq!(links.len(), 100);
+                links.iter().map(|(drv, _)| Some(drv.clone())).collect()
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            chains
+                .into_iter()
+                .map(|(path, _)| Some(path))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shared_dynamic_prefix_is_queried_only_once() {
+        let mut reads = Vec::new();
+        let mut batch_sizes = Vec::new();
+        let result = resolve_input_chains(
+            &[
+                chain("producer.drv", &["foo", "lib"]),
+                chain("producer.drv", &["foo", "bin"]),
+            ],
+            |drv, output| {
+                reads.push((drv.clone(), output.clone()));
+                None
+            },
+            |links| {
+                batch_sizes.push(links.len());
+                links
+                    .iter()
+                    .map(|(drv, output)| {
+                        if drv == &sp("producer.drv") {
+                            assert_eq!(output, &on("foo"));
+                            Some(sp("inner.drv"))
+                        } else {
+                            assert_eq!(drv, &sp("inner.drv"));
+                            Some(sp(output.as_ref()))
+                        }
+                    })
+                    .collect()
+            },
+        );
+        assert_eq!(result, vec![Some(sp("lib")), Some(sp("bin"))]);
+        assert_eq!(batch_sizes, vec![1, 2]);
+        assert_eq!(reads.len(), 3);
+    }
+
+    #[test]
+    fn shared_missing_prefix_stops_only_affected_chains() {
+        let mut calls = 0;
+        let result = resolve_input_chains(
+            &[
+                chain("missing.drv", &["foo", "lib"]),
+                chain("missing.drv", &["foo", "bin"]),
+                chain("valid.drv", &["out"]),
+            ],
+            |_, _| None,
+            |links| {
+                calls += 1;
+                assert_eq!(links.len(), 2);
+                links
+                    .iter()
+                    .map(|(drv, _)| (drv == &sp("valid.drv")).then(|| sp("valid")))
+                    .collect()
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(result, vec![None, None, Some(sp("valid"))]);
+    }
+
+    #[test]
+    fn memo_is_shared_across_depths() {
+        let mut calls = 0;
+        let result = resolve_input_chains(
+            &[chain("recursive.drv", &["foo", "foo"])],
+            |_, _| None,
+            |links| {
+                calls += 1;
+                assert_eq!(links, &[(sp("recursive.drv"), on("foo"))]);
+                vec![Some(sp("recursive.drv"))]
+            },
+        );
+        assert_eq!(result, vec![Some(sp("recursive.drv"))]);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn unreadable_or_invalid_drv_falls_back_to_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_dir = StoreDir::new(temp.path().to_str().unwrap()).unwrap();
+        fs_err::write(store_dir.display(&sp("invalid.drv")).to_string(), "broken").unwrap();
+        let mut calls = 0;
+        let result = resolve_input_chains(
+            &[
+                chain("absent.drv", &["out"]),
+                chain("invalid.drv", &["out"]),
+            ],
+            |drv, output| resolve_from_drv_file(&store_dir, drv, output),
+            |links| {
+                calls += 1;
+                vec![Some(sp("db-output")); links.len()]
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(result, vec![Some(sp("db-output")); 2]);
+    }
+
+    #[test]
+    fn harmonia_consumer_resolves_dynamic_and_opaque_inputs() {
+        let store_dir = StoreDir::new("/nix/store").unwrap();
+        let dynamic: SingleDerivedPath = format!("{}^foo^bar", sp("producer.drv")).parse().unwrap();
+        let drv = Derivation {
+            name: "consumer".parse().unwrap(),
+            outputs: Default::default(),
+            inputs: [dynamic, SingleDerivedPath::Opaque(sp("source"))]
+                .into_iter()
+                .collect(),
+            platform: "x86_64-linux".into(),
+            builder: "/bin/sh".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            structured_attrs: None,
+        };
+        let resolved = drv
+            .try_resolve_force(&store_dir, &mut |inputs| {
+                let chains: Vec<_> = inputs
+                    .iter()
+                    .map(|(path, output)| flatten_chain(path, output))
+                    .collect();
+                resolve_input_chains(
+                    &chains,
+                    |drv, output| match (drv.to_string().as_str(), output.as_ref()) {
+                        ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-producer.drv", "foo") => {
+                            Some(sp("inner.drv"))
+                        }
+                        ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-inner.drv", "bar") => Some(sp("result")),
+                        _ => panic!("unexpected dynamic link"),
+                    },
+                    |_| panic!("all links are locally resolved"),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.inputs,
+            [sp("source"), sp("result")].into_iter().collect()
+        );
+    }
 
     fn cmp(a: &StepInfo, b: &StepInfo, sort_fn: StepSortFn) -> std::cmp::Ordering {
         a.sort_key(sort_fn).cmp(&b.sort_key(sort_fn))
